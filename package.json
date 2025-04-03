@@ -1,6 +1,6 @@
 {
-  "name": "@jup-ag/locker-sdk",
-  "version": "0.1.0",
+  "name": "@dongnguyen91861/locker-sdk",
+  "version": "0.1.0-rc.1",
   "description": "",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -67,7 +67,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jup-ag/lock-sdk"
+    "url": "git+https://github.com/jup-ag/lock-sdk.git"
   },
   "keywords": [
     "jup",

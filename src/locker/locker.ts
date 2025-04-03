@@ -1,16 +1,18 @@
-import { AnchorProvider, IdlAccounts, Program, ProgramAccount, Wallet as AnchorWallet } from "@coral-xyz/anchor";
-import { Wallet } from "@jup-ag/wallet-adapter";
+import { AnchorProvider, IdlAccounts, Program, ProgramAccount, Wallet as AnchorWallet, web3 } from "@coral-xyz/anchor";
 import { ASSOCIATED_TOKEN_PROGRAM_ID, NATIVE_MINT, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token-0.4";
-import { Keypair, PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
 import BN from "bn.js";
 
 import { getOrCreateATAInstruction } from "../utils/anchor";
 import { p } from "../utils/p-flat";
 
-import { hasEphemeralSignersFeature } from "./squadsx";
 import { LockerType as LockerType } from "./types";
-import { createLockerProgram, deriveEscrow, wrapSOLInstruction } from "./utils";
+import { createLockerProgram, deriveEscrow, deriveEscrowMetadata, wrapSOLInstruction } from "./utils";
+import { IDL } from "./idl";
+import { WalletContextState } from "@jup-ag/wallet-adapter";
+
+// const NodeWallet = require("@project-serum/anchor/dist/cjs/nodewallet");
 
 export type Escrow = IdlAccounts<LockerType>["vestingEscrow"];
 export type EscrowMetadata = IdlAccounts<LockerType>["vestingEscrowMetadata"];
@@ -103,7 +105,9 @@ export function getTokenProgramFromFlag(flag: number): PublicKey | undefined {
 }
 
 export type CreateVestingPlanParams = {
+  connection: Connection;
   title: string;
+  owner: PublicKey;
   tokenMintAddress: PublicKey;
   vestingStartTime: BN;
   frequency: BN;
@@ -121,7 +125,6 @@ type CancelVestingPlanParams = {
   escrow: EscrowWithMetadata;
   signer: PublicKey;
 };
-
 export class Locker {
   program: Program<LockerType>;
 
@@ -130,7 +133,9 @@ export class Locker {
     this.program = createLockerProgram(provider.wallet as AnchorWallet, provider.connection);
   }
 
-  async createVestingPlan({
+  public static async createVestingPlan({
+    connection,
+    owner,
     title,
     tokenMintAddress,
     vestingStartTime,
@@ -144,75 +149,55 @@ export class Locker {
     cancelMode,
     tokenProgram,
   }: CreateVestingPlanParams): Promise<{
-    instructions: TransactionInstruction[];
+    tx: Transaction;
     signers: Keypair[];
   }> {
-    const {
-      provider: { wallet, connection },
-    } = this;
+    const provider = new AnchorProvider(connection, {} as any, AnchorProvider.defaultOptions());
 
-    if (!wallet?.publicKey) {
-      console.error("createVestingPlan: missing wallet public key: ", {
-        wallet,
-      });
-      return {
-        instructions: [],
-        signers: [],
-      };
-    }
-
-    const adapter = ((wallet as any).wallet as Wallet)?.adapter;
-    let ephemeralSignerPubkey: PublicKey | undefined;
-    if (adapter.name === "SquadsX" && hasEphemeralSignersFeature(adapter)) {
-      const ephemeralSignerAddress = (
-        await adapter.wallet.features["fuse:getEphemeralSigners"].getEphemeralSigners(1)
-      )[0];
-      if (!ephemeralSignerAddress) {
-        throw new Error("Unable to generate ephemeral signer address");
-      }
-      ephemeralSignerPubkey = new PublicKey(ephemeralSignerAddress);
-    }
+    const program = new Program<LockerType>(IDL, provider);
 
     const baseKP = Keypair.generate();
 
-    let [escrow] = deriveEscrow(ephemeralSignerPubkey ?? baseKP.publicKey, this.program.programId);
+    let [escrow] = deriveEscrow(baseKP.publicKey, program.programId);
 
-    const [userATA, createUserATA] = await getOrCreateATAInstruction(
-      tokenMintAddress,
-      wallet.publicKey,
-      connection,
-      wallet.publicKey
-    );
+    let preInstructions: TransactionInstruction[] = [];
 
-    const [, createEscrowATA] = await getOrCreateATAInstruction(tokenMintAddress, escrow, connection, wallet.publicKey);
+    let postInstructions: TransactionInstruction[] = [];
 
-    const metaDataIx = await this.program.methods
+    const [userATA, createUserATA] = await getOrCreateATAInstruction(tokenMintAddress, owner, connection, owner);
+
+    createUserATA && preInstructions.push(createUserATA);
+
+    const [, createEscrowATA] = await getOrCreateATAInstruction(tokenMintAddress, escrow, connection, owner);
+
+    const [escrowMetadata] = deriveEscrowMetadata(escrow, program.programId);
+
+    createEscrowATA && preInstructions.push(createEscrowATA);
+
+    const metaDataIx = await program.methods
       .createVestingEscrowMetadata({
         name: title,
         description: "",
         creatorEmail: "",
         recipientEmail: "",
       })
-      .accounts({
+      .accountsStrict({
         escrow,
-        payer: wallet.publicKey,
+        payer: owner,
+        systemProgram: web3.SystemProgram.programId,
+        creator: owner,
+        escrowMetadata,
       })
       .instruction();
 
-    let instructions: TransactionInstruction[] = [];
-    if (createUserATA) {
-      instructions.push(createUserATA);
-    }
-    if (createEscrowATA) {
-      instructions.push(createEscrowATA);
-    }
+    postInstructions.push(metaDataIx);
 
     if (tokenMintAddress.equals(NATIVE_MINT)) {
       const totalAmount = cliffUnlockAmount.add(amountPerPeriod.mul(numberOfPeriod));
 
-      const wrapSOLIx = wrapSOLInstruction(wallet.publicKey, userATA, BigInt(totalAmount.toNumber()));
+      const wrapSOLIx = wrapSOLInstruction(owner, userATA, BigInt(totalAmount.toNumber()));
 
-      instructions.push(...wrapSOLIx);
+      preInstructions.push(...wrapSOLIx);
     }
 
     // Get raw number values of modes
@@ -221,7 +206,7 @@ export class Locker {
 
     // Generate vesting plan
     const [vestingPlanTxId, err] = await p(
-      this.program.methods
+      program.methods
         .createVestingEscrowV2(
           {
             amountPerPeriod,
@@ -236,28 +221,74 @@ export class Locker {
           { slices: [] }
         )
         .accounts({
-          base: ephemeralSignerPubkey ?? baseKP.publicKey,
+          base: baseKP.publicKey,
           senderToken: userATA,
           recipient,
-          sender: wallet.publicKey,
+          sender: owner,
           tokenProgram,
-          program: this.program.programId,
+          program: program.programId,
           tokenMint: tokenMintAddress,
         })
-        .instruction()
+        .preInstructions(preInstructions)
+        .postInstructions(postInstructions)
+        .transaction()
     );
 
     if (err != null) {
       console.error("createVestingEscrowV2: failed with error: ", { err });
-    } else {
-      instructions.push(vestingPlanTxId);
     }
-    instructions.push(metaDataIx);
 
     return {
-      instructions,
-      signers: ephemeralSignerPubkey ? [] : [baseKP],
+      tx: vestingPlanTxId,
+      signers: [baseKP],
     };
+  }
+
+  static async getEscrowsWithMetadataByRecipient(
+    connection: Connection,
+    recipient: PublicKey
+  ): Promise<EscrowWithMetadata[]> {
+    const provider = new AnchorProvider(connection, {} as any, AnchorProvider.defaultOptions());
+
+    const program = new Program<LockerType>(IDL, provider);
+
+    const escrows = await program.account.vestingEscrow.all([
+      {
+        memcmp: {
+          bytes: recipient.toBase58(),
+          offset: 8,
+        },
+      },
+    ]);
+
+    const escrowPubkeyToEscrowMetadataPubkeyMap = escrows.reduce(
+      (map, escrow) =>
+        map.set(escrow.publicKey.toString(), deriveEscrowMetadata(escrow.publicKey, program.programId)[0]),
+      new Map()
+    );
+
+    const escrowMetadataPubkeys = Array.from(escrowPubkeyToEscrowMetadataPubkeyMap.values());
+    const escrowMetadatas: (EscrowMetadata | null)[] = await program.account.vestingEscrowMetadata.fetchMultiple(
+      escrowMetadataPubkeys
+    );
+
+    const escrowWithMetadatas: EscrowWithMetadata[] = [];
+    escrows.forEach((escrow, index) => {
+      const escrowMint = escrows[index]?.account?.tokenMint;
+      if (!escrowMint) {
+        console.error(`Escrow mint not found for escrow ${escrows[index].publicKey.toBase58()}`);
+        return;
+      }
+      const escrowMetadata = escrowMetadatas[index];
+      escrowWithMetadatas.push({
+        publicKey: escrow.publicKey,
+        account: escrow.account,
+        escrowMetadata: escrowMetadata ?? undefined,
+        mint: escrowMint,
+      });
+    });
+
+    return escrowWithMetadatas;
   }
 }
 
