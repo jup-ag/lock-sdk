@@ -11,6 +11,7 @@ import { LockerType as LockerType } from "./types";
 import { createLockerProgram, deriveEscrow, deriveEscrowMetadata, wrapSOLInstruction } from "./utils";
 import { IDL } from "./idl";
 import { WalletContextState } from "@jup-ag/wallet-adapter";
+import { bs58 } from "@coral-xyz/anchor/dist/cjs/utils/bytes";
 
 // const NodeWallet = require("@project-serum/anchor/dist/cjs/nodewallet");
 
@@ -289,6 +290,192 @@ export class Locker {
     });
 
     return escrowWithMetadatas;
+  }
+
+  static async getEscrowsWithMetadataByCreator(
+    connection: Connection,
+    creator: PublicKey
+  ): Promise<EscrowWithMetadata[]> {
+    const provider = new AnchorProvider(connection, {} as any, AnchorProvider.defaultOptions());
+
+    const program = new Program<LockerType>(IDL, provider);
+
+    const escrows = await program.account.vestingEscrow.all([
+      {
+        memcmp: {
+          bytes: creator.toBase58(),
+          offset: 8 + 32 * 2,
+        },
+      },
+    ]);
+
+    const escrowPubkeyToEscrowMetadataPubkeyMap = escrows.reduce(
+      (map, escrow) =>
+        map.set(escrow.publicKey.toString(), deriveEscrowMetadata(escrow.publicKey, program.programId)[0]),
+      new Map()
+    );
+
+    const escrowMetadataPubkeys = Array.from(escrowPubkeyToEscrowMetadataPubkeyMap.values());
+    const escrowMetadatas: (EscrowMetadata | null)[] = await program.account.vestingEscrowMetadata.fetchMultiple(
+      escrowMetadataPubkeys
+    );
+
+    const escrowWithMetadatas: EscrowWithMetadata[] = [];
+    escrows.forEach((escrow, index) => {
+      const escrowMint = escrows[index]?.account?.tokenMint;
+      if (!escrowMint) {
+        console.error(`Escrow mint not found for escrow ${escrows[index].publicKey.toBase58()}`);
+        return;
+      }
+      const escrowMetadata = escrowMetadatas[index];
+      escrowWithMetadatas.push({
+        publicKey: escrow.publicKey,
+        account: escrow.account,
+        escrowMetadata: escrowMetadata ?? undefined,
+        mint: escrowMint,
+      });
+    });
+
+    return escrowWithMetadatas;
+  }
+
+  static async getEscrowsWithMetadataByMint(connection: Connection, mint: PublicKey): Promise<EscrowWithMetadata[]> {
+    const provider = new AnchorProvider(connection, {} as any, AnchorProvider.defaultOptions());
+
+    const program = new Program<LockerType>(IDL, provider);
+
+    const escrows = await program.account.vestingEscrow.all([
+      {
+        memcmp: {
+          bytes: mint.toBase58(),
+          offset: 8 + 32,
+        },
+      },
+    ]);
+
+    const escrowMetadataPubkeys = escrows.map((escrow) => {
+      const [escrowMetaAcc] = deriveEscrowMetadata(escrow.publicKey, program.programId);
+      return escrowMetaAcc;
+    });
+    const escrowMetadatas = await program.account.vestingEscrowMetadata.fetchMultiple(escrowMetadataPubkeys);
+
+    const escrowsWithMetadata: EscrowWithMetadata[] = [];
+    escrows.forEach((escrow, index) => {
+      const escrowMint = escrow.account.tokenMint;
+      if (!escrowMint) {
+        console.error(`Escrow mint not found for escrow ${escrow.publicKey.toBase58()}`);
+        return;
+      }
+      const escrowWithMetadata: EscrowWithMetadata = {
+        publicKey: escrow.publicKey,
+        account: escrow.account,
+        escrowMetadata: escrowMetadatas[index] ?? undefined,
+        mint: escrowMint,
+      };
+      escrowsWithMetadata.push(escrowWithMetadata);
+    });
+
+    return escrowsWithMetadata;
+  }
+
+  static async getVestingEscrowAccountPubkeys(connection: Connection): Promise<PublicKey[]> {
+    const provider = new AnchorProvider(connection, {} as any, AnchorProvider.defaultOptions());
+
+    const program = new Program<LockerType>(IDL, provider);
+
+    const vestingEscrowDiscriminator = new Uint8Array([0xf4, 0x77, 0xb7, 0x04, 0x49, 0x74, 0x87, 0xc3]);
+    const accounts = await provider.connection.getProgramAccounts(program.programId, {
+      dataSlice: { offset: 0, length: 0 }, // Fetch without any data.
+      filters: [
+        {
+          memcmp: {
+            offset: 0,
+            bytes: bs58.encode(vestingEscrowDiscriminator),
+          },
+        },
+      ],
+    });
+    return accounts.map((account) => account.pubkey);
+  }
+
+  static async getEscrowsWithMetadataFromPubkeys(
+    connection: Connection,
+    escrowPubkeys: PublicKey[]
+  ): Promise<EscrowWithMetadata[]> {
+    const provider = new AnchorProvider(connection, {} as any, AnchorProvider.defaultOptions());
+
+    const program = new Program<LockerType>(IDL, provider);
+
+    // TODO: Limit max number of pubkeys
+
+    const escrows = await program.account.vestingEscrow.fetchMultiple(escrowPubkeys);
+
+    const escrowAccounts = escrows.flatMap((escrow, idx) => {
+      const pubkey = escrowPubkeys[idx];
+      if (!escrow || !pubkey) {
+        return [];
+      }
+      return [
+        {
+          publicKey: pubkey,
+          account: escrow,
+        },
+      ];
+    });
+
+    const escrowMetadataPubkeys = escrowAccounts.map((escrow) => {
+      const [escrowMetaAcc] = deriveEscrowMetadata(escrow.publicKey, program.programId);
+      return escrowMetaAcc;
+    });
+
+    const escrowMetadatas = await program.account.vestingEscrowMetadata.fetchMultiple(escrowMetadataPubkeys);
+
+    const escrowWithMetadatas = escrowAccounts.flatMap((escrow, idx) => {
+      const escrowMint = escrow.account.tokenMint;
+      if (!escrowMint) {
+        console.error(`Escrow mint not found for escrow ${escrow.publicKey.toBase58()}`);
+        return [];
+      }
+      const escrowMetadata = escrowMetadatas[idx];
+      return [
+        {
+          publicKey: escrow.publicKey,
+          account: escrow.account,
+          escrowMetadata: escrowMetadata ?? undefined,
+          mint: escrowMint,
+        },
+      ];
+    });
+
+    return escrowWithMetadatas;
+  }
+
+  static async getEscrowWithMetadata(
+    connection: Connection,
+    escrowPubkey: PublicKey
+  ): Promise<EscrowWithMetadata | undefined> {
+    const provider = new AnchorProvider(connection, {} as any, AnchorProvider.defaultOptions());
+
+    const program = new Program<LockerType>(IDL, provider);
+    
+    const escrow = await program.account.vestingEscrow.fetch(escrowPubkey.toBase58());
+
+    const escrowMint = escrow.tokenMint;
+    if (!escrowMint) {
+      console.error(`Escrow mint not found for escrow ${escrowPubkey.toBase58()}`);
+      return;
+    }
+
+    const [escrowMetadataPubkey] = deriveEscrowMetadata(escrowPubkey, program.programId);
+    const escrowMetadata = await program.account.vestingEscrowMetadata.fetch(escrowMetadataPubkey);
+    const escrowWithMetadata: EscrowWithMetadata = {
+      publicKey: escrowPubkey,
+      account: escrow,
+      escrowMetadata: escrowMetadata,
+      mint: escrowMint,
+    };
+
+    return escrowWithMetadata;
   }
 }
 
